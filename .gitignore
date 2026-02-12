@@ -9,6 +9,7 @@ evals
 .vscode
 .idea/
 *.debug
+.idea
 
 # agents
 agent.yaml

@@ -25,6 +25,11 @@ const (
 
 	// defaultFileTTL is the default time-to-live for uploaded files.
 	defaultFileTTL = 24 * time.Hour
+
+	// uploadMaxRetries is the number of retry attempts for transient upload failures (5xx).
+	uploadMaxRetries = 2
+	uploadBaseDelay  = 500 * time.Millisecond
+	uploadMaxDelay   = 4 * time.Second
 )
 
 // UploadedFile represents a file that has been uploaded to Anthropic.
@@ -196,18 +201,21 @@ func (fm *FileManager) GetOrUpload(ctx context.Context, filePath string) (*Uploa
 	return upload, err
 }
 
-// upload performs the actual file upload to Anthropic.
+// isRetryableUploadError returns true for transient server errors (5xx) that are worth retrying.
+func isRetryableUploadError(err error) bool {
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode >= 500
+	}
+	return false
+}
+
+// upload performs the actual file upload to Anthropic with retry for transient server errors.
 func (fm *FileManager) upload(ctx context.Context, filePath, contentHash, mimeType string, fileSize int64) (*UploadedFile, error) {
 	client, err := fm.clientFn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get client: %w", err)
 	}
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
-	defer file.Close()
 
 	filename := filepath.Base(filePath)
 
@@ -216,33 +224,68 @@ func (fm *FileManager) upload(ctx context.Context, filePath, contentHash, mimeTy
 		"mime_type", mimeType,
 		"size", fileSize)
 
-	// Use the SDK's File helper to create the upload
-	params := anthropic.BetaFileUploadParams{
-		File:  anthropic.File(file, filename, mimeType),
-		Betas: []anthropic.AnthropicBeta{filesAPIBeta},
+	var lastErr error
+	for attempt := range uploadMaxRetries + 1 {
+		if attempt > 0 {
+			delay := uploadBaseDelay * (1 << (attempt - 1))
+			if delay > uploadMaxDelay {
+				delay = uploadMaxDelay
+			}
+			slog.Warn("Retrying file upload after transient error",
+				"filename", filename,
+				"attempt", attempt+1,
+				"backoff", delay,
+				"error", lastErr)
+
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		file, err := os.Open(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open file: %w", err)
+		}
+
+		params := anthropic.BetaFileUploadParams{
+			File:  anthropic.File(file, filename, mimeType),
+			Betas: []anthropic.AnthropicBeta{filesAPIBeta},
+		}
+
+		result, uploadErr := client.Beta.Files.Upload(ctx, params)
+		file.Close()
+
+		if uploadErr != nil {
+			lastErr = uploadErr
+			if isRetryableUploadError(uploadErr) {
+				continue
+			}
+			return nil, fmt.Errorf("failed to upload file: %w", uploadErr)
+		}
+
+		upload := &UploadedFile{
+			FileID:      result.ID,
+			Filename:    result.Filename,
+			MimeType:    result.MimeType,
+			SizeBytes:   result.SizeBytes,
+			UploadedAt:  time.Now(),
+			LocalPath:   filePath,
+			ContentHash: contentHash,
+		}
+
+		slog.Info("File uploaded to Anthropic",
+			"file_id", upload.FileID,
+			"filename", upload.Filename,
+			"size", upload.SizeBytes)
+
+		return upload, nil
 	}
 
-	result, err := client.Beta.Files.Upload(ctx, params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to upload file: %w", err)
-	}
-
-	upload := &UploadedFile{
-		FileID:      result.ID,
-		Filename:    result.Filename,
-		MimeType:    result.MimeType,
-		SizeBytes:   result.SizeBytes,
-		UploadedAt:  time.Now(),
-		LocalPath:   filePath,
-		ContentHash: contentHash,
-	}
-
-	slog.Info("File uploaded to Anthropic",
-		"file_id", upload.FileID,
-		"filename", upload.Filename,
-		"size", upload.SizeBytes)
-
-	return upload, nil
+	return nil, fmt.Errorf("failed to upload file after %d attempts: %w", uploadMaxRetries+1, lastErr)
 }
 
 // Delete removes a file from Anthropic's storage.

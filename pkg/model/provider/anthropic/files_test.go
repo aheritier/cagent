@@ -1,11 +1,14 @@
 package anthropic
 
 import (
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -236,4 +239,49 @@ func TestFileManager_CleanupAll_Empty(t *testing.T) {
 	err := fm.CleanupAll(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 0, fm.CachedCount())
+}
+
+func TestIsRetryableUploadError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{"nil error", nil, false},
+		{"generic error", fmt.Errorf("something went wrong"), false},
+		{"400 bad request", &anthropic.Error{StatusCode: 400}, false},
+		{"401 unauthorized", &anthropic.Error{StatusCode: 401}, false},
+		{"403 forbidden", &anthropic.Error{StatusCode: 403}, false},
+		{"404 not found", &anthropic.Error{StatusCode: 404}, false},
+		{"413 file too large", &anthropic.Error{StatusCode: 413}, false},
+		{"429 rate limit", &anthropic.Error{StatusCode: 429}, false},
+		{"500 internal server error", &anthropic.Error{StatusCode: 500}, true},
+		{"502 bad gateway", &anthropic.Error{StatusCode: 502}, true},
+		{"503 service unavailable", &anthropic.Error{StatusCode: 503}, true},
+		{"504 gateway timeout", &anthropic.Error{StatusCode: 504}, true},
+		{"wrapped 500", fmt.Errorf("upload failed: %w", &anthropic.Error{StatusCode: 500}), true},
+		{"wrapped 400", fmt.Errorf("upload failed: %w", &anthropic.Error{StatusCode: 400}), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isRetryableUploadError(tt.err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestIsRetryableUploadError_WithRequest(t *testing.T) {
+	// Simulate the real error shape from the Anthropic SDK
+	req, _ := http.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/files?beta=true", nil)
+	resp := &http.Response{StatusCode: 500}
+	apiErr := &anthropic.Error{
+		StatusCode: 500,
+		Request:    req,
+		Response:   resp,
+		RequestID:  "req_011CYAF8kKRHegwiS7522zF5",
+	}
+
+	assert.True(t, isRetryableUploadError(apiErr))
+	assert.True(t, isRetryableUploadError(fmt.Errorf("failed to upload file: %w", apiErr)))
 }
